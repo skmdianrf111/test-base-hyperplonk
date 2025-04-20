@@ -62,12 +62,12 @@ impl<E: Pairing<ScalarField = ark_ff::Fp<MontBackend<FrConfig, 4>, 4>>>
     type SRS = UniversalParams<Bls12_381>;
     // Polynomial and its associated types
     type Polynomial = DensePolynomial<F>;
-    type ProverCommitmentAdvice = ();
     type Point = Vec<F>;
     type Evaluation = F;
     // Commitments and proofs
     type Commitment = Commitment<Bls12_381>;
     type Proof = SamaritanProof;
+    type BatchProof = ();
  
 
     fn gen_srs_for_testing<R: Rng>(rng: &mut R, log_size: usize) -> Result<UniversalParams<Bls12_381>, PCSError> {
@@ -93,13 +93,13 @@ impl<E: Pairing<ScalarField = ark_ff::Fp<MontBackend<FrConfig, 4>, 4>>>
     fn commit(
         prover_param: impl Borrow<Self::ProverParam>,
         poly: &Self::Polynomial,
-    ) -> Result<(Self::Commitment, Self::ProverCommitmentAdvice), PCSError> {
+    ) -> Result<Self::Commitment, PCSError> {
         let prover_param = prover_param.borrow();
         let commit_timer = start_timer!(|| "commit");
 
         let (comm, rand) = commit(prover_param, poly);
         end_timer!(commit_timer);
-        Ok((comm, ()))
+        Ok(comm)
     }
 
     /// On input a polynomial `p` and a point `point`, outputs a proof for the
@@ -114,9 +114,8 @@ impl<E: Pairing<ScalarField = ark_ff::Fp<MontBackend<FrConfig, 4>, 4>>>
     fn open(
         pp: impl Borrow<Self::ProverParam>,
         f_hat: &Self::Polynomial,
-        prover_advice: &Self::ProverCommitmentAdvice,
         z: &Self::Point,
-    ) -> Result<Self::Proof, PCSError> {
+    ) -> Result<(Self::Proof, Self::Evaluation), PCSError>  {
         let mut f_hat_coeffs = f_hat.coeffs();
         let miu = z.len() as u32;
         let mut evaluations = vec![F::zero(); 1 << miu];
@@ -129,7 +128,8 @@ impl<E: Pairing<ScalarField = ark_ff::Fp<MontBackend<FrConfig, 4>, 4>>>
         println!("OK111");
         // println!("evaluations{:?}",evaluations);
         let f_poly = DenseMultilinearExtension::from_evaluations_vec(miu as usize, evaluations);
-        open_internal::<E>(pp.borrow(), f_hat_coeffs, &f_poly, miu, z.to_vec())
+       let (proof,evaluation)=open_internal::<E>(pp.borrow(), f_hat_coeffs, &f_poly, miu, z.to_vec())?;
+       Ok((proof,evaluation))
     }
 
     /// Input a list of multilinear extensions, and a same number of points, and
@@ -181,7 +181,7 @@ fn open_internal<E: Pairing<ScalarField = ark_ff::Fp<MontBackend<FrConfig, 4>, 4
     f_poly: &DenseMultilinearExtension<F>,
     miu: u32,
     z: Vec<F>,
-) -> Result<SamaritanProof, PCSError> {
+) -> Result<(SamaritanProof,F), PCSError> {
     let open_timer = start_timer!(|| format!("open mle with {} variable", miu));
 
     let v = f_poly
@@ -412,16 +412,18 @@ fn open_internal<E: Pairing<ScalarField = ark_ff::Fp<MontBackend<FrConfig, 4>, 4
         F::from(l as u64),
     ];
     evaluations.extend_from_slice(&eval_slice);
+    let evaluation = evaluations[0];
 
     let mut proofs_byte = Vec::new();
     proofs.serialize_compressed(&mut proofs_byte)?;
 
     end_timer!(open_timer);
-    Ok(SamaritanProof {
+    Ok((SamaritanProof {
         commitments,
         evaluations,
         batch_proof: Some(proofs_byte),
-    })
+    },
+    evaluation))
 }
 
 fn verify_internal<E: Pairing<ScalarField = ark_ff::Fp<MontBackend<FrConfig, 4>, 4>>>(
@@ -586,7 +588,7 @@ mod tests {
     use super::*;
     use crate::pcs::multilinear_kzg::{MultilinearKzgPCS, MultilinearKzgProof};
     use ark_bls12_381::{Bls12_381, Fr, Fr as Bls12_381Fr};
-    use ark_poly::{univariate::DensePolynomial, DenseMultilinearExtension, MultilinearExtension};
+    use ark_poly::{evaluations, univariate::DensePolynomial, DenseMultilinearExtension, MultilinearExtension};
     use ark_std::{sync::Arc, test_rng, vec::Vec, UniformRand};
     use env_logger;
 
@@ -606,11 +608,11 @@ mod tests {
         let f_hat_coeffs = compute_f_hat(&evaluations, miu);
         let f_hat = DensePolynomial::from_coefficients_vec(f_hat_coeffs.clone());
 
-        let (commitment, _) = SamaritanPCS::<Bls12_381>::commit(&pp, &f_hat).expect("承诺失败");
+        let commitment = SamaritanPCS::<Bls12_381>::commit(&pp, &f_hat).expect("承诺失败");
 
         let z: Vec<F> = (0..miu).map(|_| F::rand(&mut rng)).collect();
         // let mut z: Vec<F> = vec![F::from(1), F::from(0), F::from(1), F::from(0)];
-        let proof = SamaritanPCS::<Bls12_381>::open(&pp, &f_hat, &(), &z).expect("打开承诺失败");
+        let (proof,evaluation) = SamaritanPCS::<Bls12_381>::open(&pp, &f_hat,&z).expect("打开承诺失败");
         // let v = poly.evaluate(&z);
         // println!("v={:?}",v);
         let is_valid =
@@ -645,12 +647,12 @@ mod tests {
         let eval = poly.evaluate(&z).unwrap();
 
         let commit_timer = start_timer!(|| "MultilinearKzgPCS commit");
-        let (commitment, _) =
+        let commitment=
             MultilinearKzgPCS::<E>::commit(&prover_param, &poly).expect("MultilinearKzg 承诺失败");
         end_timer!(commit_timer);
 
         let open_timer = start_timer!(|| "MultilinearKzgPCS open");
-        let proof = MultilinearKzgPCS::<E>::open(&prover_param, &poly, &(), &z)
+        let (proof,evaluation) = MultilinearKzgPCS::<E>::open(&prover_param, &poly, &z)
             .expect("MultilinearKzg 打开承诺失败");
         end_timer!(open_timer);
 
